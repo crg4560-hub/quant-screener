@@ -23,6 +23,7 @@
 """
 import argparse
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 import numpy as np
@@ -43,7 +44,11 @@ CFG = {
     "max_1m_drop": -0.30,      # 최근 1개월 -30%보다 더 빠진 '추락 중' 종목 제외
     "require_uptrend": False,  # True면 200일선 위 눌림목만 (Connors식, 더 보수적)
     # 하드 필터: 우량 + 저평가
-    "min_market_cap": 5e9,
+    "min_market_cap": 1e9,     # 시총 10억 달러 이상 (중형주까지 포함)
+    "min_price": 5,            # 동전주 제외
+    "min_dollar_vol": 5e6,     # 20일 평균 거래대금 500만 달러 이상 (유동성)
+    "min_history": 220,        # 최소 거래일 수 (신규상장 제외)
+    "max_candidates": 150,     # 재무 조회 대상 상한 (가장 과매도인 순)
     "per_max": 25,
     "pbr_max": 5,
     "rev_growth_min": 0.0,     # 매출 성장 > 0
@@ -87,13 +92,49 @@ def get_universe():
     return df.set_index("Symbol")["GICS Sector"].to_dict()
 
 
+def _read_symdir(name):
+    base = "https://www.nasdaqtrader.com/dynamic/SymDir/"
+    txt = requests.get(base + name, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
+    df = pd.read_csv(StringIO(txt), sep="|", dtype=str)
+    return df[~df.iloc[:, 0].astype(str).str.startswith("File Creation")]
+
+
+def get_all_us_tickers():
+    """NASDAQ/NYSE/AMEX 상장 보통주 전체 (ETF·우선주·워런트·SPAC·ADR 제외)"""
+    bad_name = r"\b(?:warrants?|rights?|units?)\b|preferred|depositary|acquisition corp|notes due|debenture"
+    nq = _read_symdir("nasdaqlisted.txt")
+    nq = nq[(nq["Test Issue"] == "N") & (nq["ETF"] == "N") & (nq["Financial Status"] == "N")]
+    ot = _read_symdir("otherlisted.txt")
+    ot = ot[(ot["Test Issue"] == "N") & (ot["ETF"] == "N")]
+    rows = pd.concat([
+        nq[["Symbol", "Security Name"]].set_axis(["sym", "name"], axis=1),
+        ot[["ACT Symbol", "Security Name"]].set_axis(["sym", "name"], axis=1),
+    ])
+    rows = rows[~rows["name"].str.contains(bad_name, case=False, regex=True, na=False)]
+    rows = rows[~rows["sym"].str.contains(r"[\$\^~=]", regex=True, na=False)]
+    syms = rows["sym"].str.replace(".", "-", regex=False).drop_duplicates().tolist()
+    return [x for x in syms if 0 < len(x) <= 5 or "-" in x]
+
+
+def get_tickers(universe="all"):
+    if universe == "all":
+        try:
+            t = get_all_us_tickers()
+            print(f"미국 전체 종목 {len(t)}개")
+            return t
+        except Exception as e:
+            print(f"전체 종목 목록 실패({e}) -> S&P500으로 대체")
+    uni = get_universe()
+    return [t for t, sec in uni.items() if sec not in EXCLUDED_SECTORS]
+
+
 def download_ohlc(tickers, period):
     raw = yf.download(tickers, period=period, auto_adjust=True, progress=False,
                       group_by="column", threads=True)
     if not isinstance(raw.columns, pd.MultiIndex):
         raw.columns = pd.MultiIndex.from_product([raw.columns, list(tickers)])
     close = raw["Close"].dropna(how="all", axis=1)
-    return {f: raw[f][close.columns] for f in ["Open", "High", "Low", "Close"]}
+    return {f: raw[f][close.columns] for f in ["Open", "High", "Low", "Close", "Volume"]}
 
 
 def rsi(close, n=14):
@@ -134,9 +175,7 @@ def market_regime():
 
 
 # ───────────── 2) 기술적 스캔 [Bollinger + Connors] ─────────────
-def technical_scan(tickers):
-    print(f"[1/3] 가격 데이터 다운로드 ({len(tickers)}종목)...")
-    d = download_ohlc(tickers, "2y")
+def _scan_chunk(d):
     c = d["Close"]
     pctb, bw = bollinger(c, CFG["bb_window"], CFG["bb_std"])
     last = pd.DataFrame({
@@ -146,14 +185,42 @@ def technical_scan(tickers):
         "RSI14": rsi(c, CFG["rsi_period"]).iloc[-1],
         "RSI2": rsi(c, 2).iloc[-1],
         "uptrend": c.iloc[-1] > c.rolling(200).mean().iloc[-1],
-        "mom_12_1": c.iloc[-22] / c.iloc[-253] - 1,
+        "mom_12_1": c.iloc[-22] / c.iloc[-253] - 1 if len(c) >= 253 else np.nan,
         "ret_1m": c.iloc[-1] / c.iloc[-22] - 1,
         "ATR": atr(d["High"], d["Low"], c).iloc[-1],
+        "dollar_vol": (c * d["Volume"]).rolling(20).mean().iloc[-1],
+        "n": c.count(),
     })
-    hit = last[(last.pctB <= CFG["pctb_max"]) & (last.RSI14 <= CFG["rsi_max"])
-               & (last.ret_1m >= CFG["max_1m_drop"])]
+    return last[(last.pctB <= CFG["pctb_max"]) & (last.RSI14 <= CFG["rsi_max"])
+                & (last.ret_1m >= CFG["max_1m_drop"])
+                & (last.price >= CFG["min_price"])
+                & (last.dollar_vol >= CFG["min_dollar_vol"])
+                & (last.n >= CFG["min_history"])]
+
+
+def technical_scan(tickers, chunk=400):
+    print(f"[1/3] 가격 데이터 다운로드 ({len(tickers)}종목, {chunk}개씩 나눠서)...")
+    parts = []
+    for k in range(0, len(tickers), chunk):
+        part = tickers[k:k + chunk]
+        try:
+            d = download_ohlc(part, "2y")
+            if d["Close"].shape[1] == 0:
+                continue
+            parts.append(_scan_chunk(d))
+        except Exception as e:
+            print(f"      묶음 {k // chunk + 1} 건너뜀: {e}")
+        print(f"      {min(k + chunk, len(tickers))}/{len(tickers)} 완료")
+    hit = pd.concat(parts) if parts else pd.DataFrame()
+    if hit.empty:
+        print("      기술적 조건 통과: 0종목")
+        return hit
     if CFG["require_uptrend"]:
         hit = hit[hit.uptrend]
+    if len(hit) > CFG["max_candidates"]:
+        depth = hit.RSI14.rank() + hit.pctB.rank()
+        hit = hit.loc[depth.nsmallest(CFG["max_candidates"]).index]
+        print(f"      후보가 많아 가장 과매도인 {CFG['max_candidates']}개만 재무 분석합니다.")
     print(f"      기술적 조건 통과: {len(hit)}종목")
     return hit
 
@@ -174,9 +241,34 @@ def pct_change(a, b):
     return (a - b) / abs(b) if pd.notna(a) and pd.notna(b) and b != 0 else np.nan
 
 
+def _f(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+
+def quick_ok(info):
+    """info 한 번으로 가능한 값싼 필터 (통과 못 하면 재무제표는 아예 안 받음)"""
+    c = CFG
+    if info.get("sector") in EXCLUDED_SECTORS:
+        return False
+    per, pbr = _f(info.get("trailingPE")), _f(info.get("priceToBook"))
+    om, roe, de = _f(info.get("operatingMargins")), _f(info.get("returnOnEquity")), _f(info.get("debtToEquity"))
+    if _f(info.get("marketCap")) < c["min_market_cap"]:
+        return False
+    if not (0.01 <= per <= c["per_max"]) or not (pbr <= c["pbr_max"]):
+        return False
+    if not (om >= c["op_margin_min"]) or not (roe >= c["roe_min"]):
+        return False
+    return not (de > c["debt_to_equity_max"])
+
+
 def fundamentals(tk):
     t = yf.Ticker(tk)
     info = t.info or {}
+    if not quick_ok(info):
+        return None
     fin, bs, cf = t.financials, t.balance_sheet, t.cashflow
     g = lambda df, names, col=0, default=np.nan: pick(df, names, col, default)
 
@@ -255,15 +347,15 @@ def fundamentals(tk):
 
 def fundamental_filter(cands):
     print(f"[2/3] 재무 데이터 조회 ({len(cands)}종목)...")
-    rows = []
-    for tk in cands.index:
+    def safe(tk):
         try:
-            r = fundamentals(tk)
-            if r["sector"] in EXCLUDED_SECTORS:
-                continue
-            rows.append(r)
+            return fundamentals(tk)
         except Exception as e:
             print(f"      {tk} 건너뜀: {e}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = [r for r in ex.map(safe, cands.index) if r]
     if not rows:
         return pd.DataFrame()
     df = cands.join(pd.DataFrame(rows).set_index("ticker"), how="inner")
@@ -370,7 +462,9 @@ def backtest(tickers):
 # ───────────── main ─────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tickers", nargs="*", help="직접 지정 (기본: S&P500)")
+    ap.add_argument("--tickers", nargs="*", help="직접 지정")
+    ap.add_argument("--universe", choices=["all", "sp500"], default="all",
+                    help="all=미국 전체(기본), sp500=S&P500")
     ap.add_argument("--account", type=float, help="계좌 금액(USD)")
     ap.add_argument("--backtest", action="store_true", help="기술적 규칙 백테스트")
     args = ap.parse_args()
@@ -379,9 +473,10 @@ def main():
 
     if args.tickers:
         tickers = args.tickers
+    elif args.backtest:
+        tickers = get_tickers("sp500")  # 백테스트는 시간 문제로 S&P500만
     else:
-        uni = get_universe()
-        tickers = [t for t, s in uni.items() if s not in EXCLUDED_SECTORS]
+        tickers = get_tickers(args.universe)
 
     if args.backtest:
         backtest(tickers)

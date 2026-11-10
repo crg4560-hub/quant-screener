@@ -1,25 +1,35 @@
+import glob
+import importlib.util
+import os
+
 import streamlit as st
 
-import us_quant_screener_v2 as m
+# 파일 이름에 띄어쓰기/밑줄이 섞여 있어도 스크리너 파일을 찾아서 불러옵니다
+_here = os.path.dirname(os.path.abspath(__file__))
+_path = sorted(glob.glob(os.path.join(_here, "us*quant*screener*v2*.py")))[0]
+_spec = importlib.util.spec_from_file_location("screener", _path)
+m = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(m)
 
 st.set_page_config(page_title="퀀트 스크리너", page_icon="📈", layout="centered")
 st.title("📈 미국주식 퀀트 스크리너")
-st.caption("볼린저 바닥 + RSI 과매도 + 저평가 우량주 · S&P 500 기준")
+st.caption("볼린저 바닥 + RSI 과매도 + 저평가 우량주 · 미국 상장 보통주 전체 · 시총 10억 달러 이상")
 
 with st.expander("설정", expanded=False):
     account = st.number_input("계좌 금액 (USD)", 1000, 10_000_000, 10000, step=1000)
     rsi_max = st.slider("RSI 상한 (낮을수록 엄격)", 20, 45, 35)
     pctb_max = st.slider("볼린저 %B 상한 (낮을수록 바닥)", 0.0, 0.4, 0.15, 0.01)
     top_n = st.slider("표시할 종목 수", 1, 10, 3)
+    universe_label = st.radio("대상", ["미국 전체 (5~10분)", "S&P 500 (빠름)"])
+universe = "all" if universe_label.startswith("미국") else "sp500"
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def run(account, rsi_max, pctb_max):
+def run(account, rsi_max, pctb_max, universe):
     m.CFG["account"] = account
     m.CFG["rsi_max"] = rsi_max
     m.CFG["pctb_max"] = pctb_max
-    uni = m.get_universe()
-    tickers = [t for t, s in uni.items() if s not in m.EXCLUDED_SECTORS]
+    tickers = m.get_tickers(universe)
     regime = m.market_regime()
     cands = m.technical_scan(tickers)
     if cands.empty:
@@ -31,8 +41,8 @@ def run(account, rsi_max, pctb_max):
 
 
 if st.button("🔍 오늘의 후보 찾기", type="primary", use_container_width=True):
-    with st.spinner("분석 중입니다... (2~5분 걸려요)"):
-        res, regime = run(account, rsi_max, pctb_max)
+    with st.spinner("분석 중입니다... (미국 전체는 5~10분, 화면을 켜두세요)"):
+        res, regime = run(account, rsi_max, pctb_max, universe)
     st.session_state["out"] = (res, regime)
 
 if "out" in st.session_state:
